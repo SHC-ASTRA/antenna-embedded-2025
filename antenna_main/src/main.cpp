@@ -27,6 +27,8 @@
 // Comment out to disable LED blinking
 #define BLINK
 
+#define ENABLE_MOVE
+
 // Enter a MAC address and IP address for your controller below.
 // The IP address will be dependent on your local network:
 byte mac[] = {
@@ -61,6 +63,7 @@ long lastAlignment = 0;
 long lastRoverPos = 0;
 double roverlat = 0;
 double roverlon = 0;
+double gps_data[3] = {0};
 long lastPrint = 0;
 
 int requiredHeading = 0;
@@ -247,6 +250,10 @@ void loop() {
         Serial.print(accel);
         Serial.print(" Mag=");
         Serial.println(mag);
+        Serial.print("My position: ");
+        Serial.print(gps_data[0], 7);
+        Serial.print(", ");
+        Serial.println(gps_data[1], 7);
         Serial.print("My heading: "); Serial.print(currentHeading);
         Serial.print("\tRequired heading: "); Serial.println(requiredHeading);
         Serial.println();
@@ -256,7 +263,6 @@ void loop() {
         lastAlignment = millis();
 
         // Get lat/lon from GNSS
-        double gps_data[3] = {0};
         getPosition(myGNSS, gps_data);
         double mylat = gps_data[0];
         double mylon = gps_data[1];
@@ -271,6 +277,7 @@ void loop() {
 
         // Make LSS rotate towards the required heading
         int error = requiredHeading - currentHeading;
+#ifdef ENABLE_MOVE
         if (abs(error) < 5) {  // stop if within tolerance (arbitrary)
             myLSS.wheel(0);
         } else if (error > 0) {
@@ -278,6 +285,7 @@ void loop() {
         } else if (error < 0) {
             myLSS.wheel(-20);
         }
+#endif
     }
 
 
