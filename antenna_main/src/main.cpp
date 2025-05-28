@@ -193,6 +193,9 @@ void setup() {
     //--------------------//
 
 	LSS::initBus(Serial2, LSS_DefaultBaud);
+#ifndef ENABLE_MOVE
+    myLSS.limp();
+#endif
     Serial.println("Setup finished.");
 }
 
