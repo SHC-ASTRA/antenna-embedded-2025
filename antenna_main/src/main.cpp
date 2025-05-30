@@ -27,7 +27,7 @@
 // Comment out to disable LED blinking
 #define BLINK
 
-#define ENABLE_MOVE
+// #define ENABLE_MOVE
 
 #define ANGLE_LIM 179
 
@@ -37,6 +37,8 @@ byte mac[] = {
     0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED
 };
 IPAddress ip(192, 168, 1, 4);
+
+IPAddress bsIP(192, 168, 1, 31);
 
 const unsigned int localPort = 42069;  // local port to listen on for UDP packets
 
@@ -323,9 +325,11 @@ void loop() {
         output += ",";
         output += mag;
         output += "\n";
-        Udp.beginPacket(Udp.remoteIP(), localPort);  // Basestation listens on same port as us
-        Udp.write(output.c_str());
-        Udp.endPacket();
+        // Udp.beginPacket(bsIP, localPort);  // Basestation listens on same port as us
+        // Udp.write(output.c_str());
+        // Udp.endPacket();
+
+        // GPS position
     }
 
 
@@ -390,18 +394,7 @@ void loop() {
         std::vector<String> args = {};
         parseInput(input, args);
 
-        if (args.size() == 2) {
-            double lat = args[0].toDouble();
-            double lon = args[1].toDouble();
-            lastRoverPos = millis();
-            roverlat = lat;
-            roverlon = lon;
-            Serial.print("Rover: ");
-            Serial.print(roverlat);
-            Serial.print(", ");
-            Serial.println(roverlon);
-
-        } else if (args[0] == "reset") {
+        if (args[0] == "reset") {
             Serial.println("Resetting LSS...");
             myLSS.reset();
 
@@ -418,6 +411,17 @@ void loop() {
             enableMove = false;
             myLSS.hold();
             Serial.println("LSS is now in hold mode.");
+
+        } else if (args.size() == 2) {
+            double lat = args[0].toDouble();
+            double lon = args[1].toDouble();
+            lastRoverPos = millis();
+            roverlat = lat;
+            roverlon = lon;
+            Serial.print("Rover: ");
+            Serial.print(roverlat);
+            Serial.print(", ");
+            Serial.println(roverlon);
         }
     }
 
