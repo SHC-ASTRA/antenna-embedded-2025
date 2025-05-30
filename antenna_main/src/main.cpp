@@ -27,7 +27,7 @@
 // Comment out to disable LED blinking
 #define BLINK
 
-// #define ENABLE_MOVE
+#define ENABLE_MOVE
 
 #define ANGLE_LIM 179
 
@@ -76,7 +76,11 @@ double my_pos[3] = {0};
 int currentHeading = 0;
 int requiredHeading = 0;
 
-bool enableMove = true;  // Set to false to manually turn antenna mast
+enum MoveMode {
+    LIMP = 0,
+    HOLD,
+    TRACK
+} moveMode;
 
 bool gpsFoundOnBoot = false;
 
@@ -86,6 +90,7 @@ bool gpsFoundOnBoot = false;
 //--------------//
 
 int calcHeading(double mylat, double mylon, double targetlat, double targetlon);
+float clamp_angle(float angle);
 
 
 //------------------------------------------------------------------------------------------------//
@@ -206,7 +211,8 @@ void setup() {
     //--------------------//
 
 	LSS::initBus(Serial2, LSS_DefaultBaud);
-    myLSS.limp();
+    moveMode = TRACK;
+    myLSS.limp();  // Wait to align antenna
     // myLSS.wheel(0);  // Hold
     Serial.println("Setup finished.");
 }
@@ -243,7 +249,6 @@ void loop() {
     // Timeout
     if (millis() - lastRoverPos > 5000 && millis() - lastAlignment < 1000 && millis() > 5000) {
         myLSS.wheel(0);  // Stop if no rover position received in 5 seconds
-        // Serial.println("No rover position received in 5 seconds. Stopping LSS.");
     }
 
     // Polling sensors
@@ -259,10 +264,18 @@ void loop() {
         getPosition(myGNSS, my_pos);
 
         requiredHeading = calcHeading(my_pos[0], my_pos[1], roverlat, roverlon);
+
+        currentHeading = clamp_angle(currentHeading);
+        requiredHeading = clamp_angle(requiredHeading);
+        if (requiredHeading > 170) {
+            requiredHeading = 170;
+        } else if (requiredHeading < -170) {
+            requiredHeading = -170;
+        }
     }
 
     // Sending info to Serial
-    if (millis() - lastPrint > 500) {
+    if (millis() - lastPrint > 2000) {
         lastPrint = millis();
 
         uint8_t system, gyro, accel, mag = 0;
@@ -311,25 +324,28 @@ void loop() {
     if (millis() - lastTelemetry > 1000) {
         lastTelemetry = millis();
 
-        // Calibration status
+        // Full status
         uint8_t system, gyro, accel, mag = 0;
         bno.getCalibration(&system, &gyro, &accel, &mag);
         String output;
-        output.reserve(24);
-        output = "calib,";
-        output += system;
-        output += ",";
-        output += gyro;
-        output += ",";
-        output += accel;
-        output += ",";
-        output += mag;
-        output += "\n";
-        // Udp.beginPacket(bsIP, localPort);  // Basestation listens on same port as us
-        // Udp.write(output.c_str());
-        // Udp.endPacket();
-
-        // GPS position
+        output.reserve(128);
+        char buff[16];
+        output += "{ \"lat\": ";
+        dtostrf(my_pos[0], 5, 7, buff);
+        output += buff;
+        output += ", \"lon\": ";
+        dtostrf(my_pos[1], 5, 7, buff);
+        output += buff;
+        output += ", \"sat\": ";
+        output += int(my_pos[2]);
+        output += ", \"heading\": ";
+        output += currentHeading;
+        output += ", \"calib\": ";
+        output += system * 1000 + gyro * 100 + accel * 10 + mag;
+        output += " }\n";
+        Udp.beginPacket(Udp.remoteIP(), 42069);
+        Udp.write(output.c_str(), output.length());
+        Udp.endPacket();
     }
 
 
@@ -343,9 +359,10 @@ void loop() {
 
         // Make LSS rotate towards the required heading
         int error = requiredHeading - currentHeading;
-        if (enableMove && mag == 3 && my_pos[2] >= 3) {  // Only move if magnetometer is calibrated and at least 3 satellites
+        if (moveMode == TRACK && mag > 0 && my_pos[2] >= 3) {  // Only move if magnetometer is calibrated and at least 3 satellites
 #ifdef ENABLE_MOVE
-            if (abs(error) < 5) {  // stop if within tolerance (arbitrary)
+            // Stop if within tolerance
+            if (abs(error) < 5 || currentHeading > 170 || currentHeading < -170) {
                 myLSS.wheel(0);
             } else if (error > 0) {
                 myLSS.wheel(20);
@@ -357,8 +374,11 @@ void loop() {
                 Serial.print("Would be moving, but LSS movement disabled in code. Uncomment ENABLE_MOVE to enable movement.");
             }
 #endif
-        } else if (enableMove) {
-            Serial.println("Insufficient sensor data, holding position.");
+        } else {
+            myLSS.hold();
+            Serial.println("Insufficient sensor data, please check GPS and IMU.");
+            if (moveMode == LIMP)
+                myLSS.limp();
         }
     }
 
@@ -367,11 +387,11 @@ void loop() {
     //  UDP Input  //
     //-------------//
     
-    char packetBuffer[UDP_TX_PACKET_MAX_SIZE];  // buffer to hold incoming packet
+    char packetBuffer[128];  // buffer to hold incoming packet
 
     int packetSize = Udp.parsePacket();
     if (packetSize) {
-        Serial.print("Received packet from ");
+        Serial.print("\nReceived packet from ");
         IPAddress remote = Udp.remoteIP();
         for (int i = 0; i < 4; i++) {
             Serial.print(remote[i], DEC);
@@ -383,7 +403,7 @@ void loop() {
         Serial.print(Udp.remotePort());
 
         // read the packet into packetBuffer
-        Udp.read(packetBuffer, UDP_TX_PACKET_MAX_SIZE);
+        Udp.read(packetBuffer, 128);
         Serial.print(" [");
         Serial.print(packetSize);
         Serial.print("] ");
@@ -391,6 +411,7 @@ void loop() {
 
         String input = String(packetBuffer);
         input.trim();
+        input.toLowerCase();
         std::vector<String> args = {};
         parseInput(input, args);
 
@@ -398,17 +419,17 @@ void loop() {
             Serial.println("Resetting LSS...");
             myLSS.reset();
 
-        } else if (args[0] == "track") {
-            enableMove = true;
+        } else if (args[0] == "track" || args[0].startsWith("track")) {
+            moveMode = TRACK;
             Serial.println("LSS is now in normal mode.");
 
-        } else if (args[0] == "limp") {
-            enableMove = false;
+        } else if (args[0] == "limp" || args[0].startsWith("limp")) {
+            moveMode = LIMP;
             myLSS.limp();
             Serial.println("LSS is now in limp mode.");
 
-        } else if (args[0] == "hold") {
-            enableMove = false;
+        } else if (args[0] == "hold" || args[0].startsWith("hold")) {
+            moveMode = HOLD;
             myLSS.hold();
             Serial.println("LSS is now in hold mode.");
 
@@ -535,4 +556,15 @@ int calcHeading(double mylat, double mylon, double targetlat, double targetlon) 
 
     int deg = atan2(x, y) * 180.0 / M_PI;  // Calculate angle and convert to degrees [-180, 180]
     return (deg + 360) % 360;  // Normalize to 0-360 degrees
+}
+
+float clamp_angle(float angle) {
+    angle = fmod(angle, 360.0);
+    if (angle < 0) {
+        angle += 360;
+    }
+    if (angle > 180) {
+        angle -= 360;
+    }
+    return angle;
 }
