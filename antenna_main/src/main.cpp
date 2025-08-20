@@ -27,12 +27,18 @@
 // Comment out to disable LED blinking
 #define BLINK
 
+#define ENABLE_MOVE
+
+#define ANGLE_LIM 179
+
 // Enter a MAC address and IP address for your controller below.
 // The IP address will be dependent on your local network:
 byte mac[] = {
     0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED
 };
 IPAddress ip(192, 168, 1, 4);
+
+IPAddress bsIP(192, 168, 1, 31);
 
 const unsigned int localPort = 42069;  // local port to listen on for UDP packets
 
@@ -59,11 +65,24 @@ bool ledState = false;
 
 long lastAlignment = 0;
 long lastRoverPos = 0;
+long lastPrint = 0;
+long lastTelemetry = 0;
+long lastSensorPoll = 0;
+
+
 double roverlat = 0;
 double roverlon = 0;
-long lastPrint = 0;
-
+double my_pos[3] = {0};
+int currentHeading = 0;
 int requiredHeading = 0;
+
+enum MoveMode {
+    LIMP = 0,
+    HOLD,
+    TRACK
+} moveMode;
+
+bool gpsFoundOnBoot = false;
 
 
 //--------------//
@@ -71,6 +90,7 @@ int requiredHeading = 0;
 //--------------//
 
 int calcHeading(double mylat, double mylon, double targetlat, double targetlon);
+float clamp_angle(float angle);
 
 
 //------------------------------------------------------------------------------------------------//
@@ -126,14 +146,15 @@ void setup() {
     //  Sensors  //
     //-----------//
 
-    if(!bno.begin()) 
-        Serial.println("!BNO failed to start...");
-    else 
-        Serial.println("BNO055 Started Successfully");
+    if(!bno.begin())
+        Serial.println("BNO055 failed");
+    else
+        Serial.println("BNO055 started successfully");
 
-    if(!myGNSS.begin()) 
+    gpsFoundOnBoot = myGNSS.begin();
+    if(!gpsFoundOnBoot)
         Serial.println("GPS not working");
-    else 
+    else
         Serial.println("GPS is working");
 
 
@@ -190,6 +211,9 @@ void setup() {
     //--------------------//
 
 	LSS::initBus(Serial2, LSS_DefaultBaud);
+    moveMode = TRACK;
+    myLSS.limp();  // Wait to align antenna
+    // myLSS.wheel(0);  // Hold
     Serial.println("Setup finished.");
 }
 
@@ -222,20 +246,38 @@ void loop() {
     }
 #endif
 
+    // Timeout
     if (millis() - lastRoverPos > 5000 && millis() - lastAlignment < 1000 && millis() > 5000) {
         myLSS.wheel(0);  // Stop if no rover position received in 5 seconds
-        // Serial.println("No rover position received in 5 seconds. Stopping LSS.");
     }
 
-    if (millis() - lastPrint > 500) {
-        lastPrint = millis();
-        // Get heading measurement from IMU
+    // Polling sensors
+    if (millis() - lastSensorPoll > 100) {
+        lastSensorPoll = millis();
+
+        // Poll BNO055 for orientation data
         sensors_event_t orientationData;
         bno.getEvent(&orientationData, Adafruit_BNO055::VECTOR_EULER);
-        int currentHeading = orientationData.orientation.x;
+        currentHeading = orientationData.orientation.x;
 
-        // Serial.printf("My pos: %f, %f\n", mylat, mylon);
-        // Serial.printf("Rover pos: %f, %f\n", roverlat, roverlon);
+        // Poll GNSS for position data
+        getPosition(myGNSS, my_pos);
+
+        requiredHeading = calcHeading(my_pos[0], my_pos[1], roverlat, roverlon);
+
+        currentHeading = clamp_angle(currentHeading);
+        requiredHeading = clamp_angle(requiredHeading);
+        if (requiredHeading > 170) {
+            requiredHeading = 170;
+        } else if (requiredHeading < -170) {
+            requiredHeading = -170;
+        }
+    }
+
+    // Sending info to Serial
+    if (millis() - lastPrint > 2000) {
+        lastPrint = millis();
+
         uint8_t system, gyro, accel, mag = 0;
         bno.getCalibration(&system, &gyro, &accel, &mag);
         Serial.println();
@@ -246,37 +288,97 @@ void loop() {
         Serial.print(" Accel=");
         Serial.print(accel);
         Serial.print(" Mag=");
-        Serial.println(mag);
-        Serial.print("My heading: "); Serial.print(currentHeading);
-        Serial.print("\tRequired heading: "); Serial.println(requiredHeading);
+        Serial.print(mag);
+        Serial.println();
+
+        if (!gpsFoundOnBoot) {
+            Serial.println("GPS not found on boot.");
+        }
+        Serial.print("   My position: ");
+        Serial.print(my_pos[0], 7);
+        Serial.print(",  ");
+        Serial.print(my_pos[1], 7);
+        Serial.print(" (");
+        Serial.print(my_pos[2]);
+        Serial.print(" sats)");
+        Serial.println();
+
+        Serial.print("Rover position: ");
+        Serial.print(roverlat, 7);
+        Serial.print(",  ");
+        Serial.print(roverlon, 7);
+        Serial.println();
+
+        Serial.print("Required heading: ");
+        Serial.print(requiredHeading);
+        Serial.print("    My heading: ");
+        Serial.print(currentHeading);
+        Serial.println();
+
+        Serial.print("LSS position: ");
+        Serial.print(myLSS.getPosition());
         Serial.println();
     }
 
+    // Sending info back to basestation
+    if (millis() - lastTelemetry > 1000) {
+        lastTelemetry = millis();
+
+        // Full status
+        uint8_t system, gyro, accel, mag = 0;
+        bno.getCalibration(&system, &gyro, &accel, &mag);
+        String output;
+        output.reserve(128);
+        char buff[16];
+        output += "{ \"lat\": ";
+        dtostrf(my_pos[0], 5, 7, buff);
+        output += buff;
+        output += ", \"lon\": ";
+        dtostrf(my_pos[1], 5, 7, buff);
+        output += buff;
+        output += ", \"sat\": ";
+        output += int(my_pos[2]);
+        output += ", \"heading\": ";
+        output += currentHeading;
+        output += ", \"calib\": ";
+        output += system * 1000 + gyro * 100 + accel * 10 + mag;
+        output += " }\n";
+        Udp.beginPacket(Udp.remoteIP(), 42069);
+        Udp.write(output.c_str(), output.length());
+        Udp.endPacket();
+    }
+
+
+    // Main control loop
     if (millis() - lastAlignment > 100 && millis() - lastRoverPos < 5000 && millis() > 5000) {  // Requires update <5 seconds ago
         lastAlignment = millis();
 
-        // Get lat/lon from GNSS
-        double gps_data[3] = {0};
-        getPosition(myGNSS, gps_data);
-        double mylat = gps_data[0];
-        double mylon = gps_data[1];
-
-        // Calculate required heading to point antenna at rover
-        requiredHeading = calcHeading(mylat, mylon, roverlat, roverlon);
-
-        // Get heading measurement from IMU
-        sensors_event_t orientationData;
-        bno.getEvent(&orientationData, Adafruit_BNO055::VECTOR_EULER);
-        int currentHeading = orientationData.orientation.x;
+        // Check calibration
+        uint8_t mag = 0;
+        bno.getCalibration(nullptr, nullptr, nullptr, &mag);
 
         // Make LSS rotate towards the required heading
         int error = requiredHeading - currentHeading;
-        if (abs(error) < 5) {  // stop if within tolerance (arbitrary)
-            myLSS.wheel(0);
-        } else if (error > 0) {
-            myLSS.wheel(20);
-        } else if (error < 0) {
-            myLSS.wheel(-20);
+        if (moveMode == TRACK && mag > 0 && my_pos[2] >= 3) {  // Only move if magnetometer is calibrated and at least 3 satellites
+#ifdef ENABLE_MOVE
+            // Stop if within tolerance
+            if (abs(error) < 5 || currentHeading > 170 || currentHeading < -170) {
+                myLSS.wheel(0);
+            } else if (error > 0) {
+                myLSS.wheel(20);
+            } else if (error < 0) {
+                myLSS.wheel(-20);
+            }
+#else
+            if (abs(error) >= 5) {
+                Serial.print("Would be moving, but LSS movement disabled in code. Uncomment ENABLE_MOVE to enable movement.");
+            }
+#endif
+        } else {
+            myLSS.hold();
+            Serial.println("Insufficient sensor data, please check GPS and IMU.");
+            if (moveMode == LIMP)
+                myLSS.limp();
         }
     }
 
@@ -285,11 +387,11 @@ void loop() {
     //  UDP Input  //
     //-------------//
     
-    char packetBuffer[UDP_TX_PACKET_MAX_SIZE];  // buffer to hold incoming packet
+    char packetBuffer[128];  // buffer to hold incoming packet
 
     int packetSize = Udp.parsePacket();
     if (packetSize) {
-        Serial.print("Received packet from ");
+        Serial.print("\nReceived packet from ");
         IPAddress remote = Udp.remoteIP();
         for (int i = 0; i < 4; i++) {
             Serial.print(remote[i], DEC);
@@ -301,7 +403,7 @@ void loop() {
         Serial.print(Udp.remotePort());
 
         // read the packet into packetBuffer
-        Udp.read(packetBuffer, UDP_TX_PACKET_MAX_SIZE);
+        Udp.read(packetBuffer, 128);
         Serial.print(" [");
         Serial.print(packetSize);
         Serial.print("] ");
@@ -309,23 +411,38 @@ void loop() {
 
         String input = String(packetBuffer);
         input.trim();
+        input.toLowerCase();
         std::vector<String> args = {};
         parseInput(input, args);
 
-        if (args.size() == 2) {
+        if (args[0] == "reset") {
+            Serial.println("Resetting LSS...");
+            myLSS.reset();
+
+        } else if (args[0] == "track" || args[0].startsWith("track")) {
+            moveMode = TRACK;
+            Serial.println("LSS is now in normal mode.");
+
+        } else if (args[0] == "limp" || args[0].startsWith("limp")) {
+            moveMode = LIMP;
+            myLSS.limp();
+            Serial.println("LSS is now in limp mode.");
+
+        } else if (args[0] == "hold" || args[0].startsWith("hold")) {
+            moveMode = HOLD;
+            myLSS.hold();
+            Serial.println("LSS is now in hold mode.");
+
+        } else if (args.size() == 2) {
             double lat = args[0].toDouble();
             double lon = args[1].toDouble();
-            // if (lat != 0 && lon != 0) {
-                lastRoverPos = millis();
-                roverlat = lat;
-                roverlon = lon;
-                Serial.print("Rover: ");
-                Serial.print(roverlat);
-                Serial.print(", ");
-                Serial.println(roverlon);
-            // }
-        } else if (args[0] == "reset") {
-            myLSS.reset();
+            lastRoverPos = millis();
+            roverlat = lat;
+            roverlon = lon;
+            Serial.print("Rover: ");
+            Serial.print(roverlat);
+            Serial.print(", ");
+            Serial.println(roverlon);
         }
     }
 
@@ -393,6 +510,14 @@ void loop() {
             myLSS.reset();
         }
 
+        else if (command == "hold") {
+            myLSS.wheel(0);
+        }
+
+        else if (command == "limp") {
+            myLSS.limp();
+        }
+
         //-----------//
         //  Sensors  //
         //-----------//
@@ -431,4 +556,15 @@ int calcHeading(double mylat, double mylon, double targetlat, double targetlon) 
 
     int deg = atan2(x, y) * 180.0 / M_PI;  // Calculate angle and convert to degrees [-180, 180]
     return (deg + 360) % 360;  // Normalize to 0-360 degrees
+}
+
+float clamp_angle(float angle) {
+    angle = fmod(angle, 360.0);
+    if (angle < 0) {
+        angle += 360;
+    }
+    if (angle > 180) {
+        angle -= 360;
+    }
+    return angle;
 }
